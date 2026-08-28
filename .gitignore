@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+
+# Build artifacts
+.aws-sam/
+build/
+dist/
+*.zip
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+config.sh
+.aws/
+*.pem
+*.p12
+*.key
+
+# Generated data
+data/
+*.parquet

@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Reference infrastructure for the Social Benefits Data Pipeline
+
+Parameters:
+  PortalApiSecretName:
+    Type: String
+    Description: Existing Secrets Manager secret containing chave-api-dados
+  GlueScriptUri:
+    Type: String
+    Description: S3 URI of glue/social_benefits_transform.py
+
+Resources:
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  DetectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/detector/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataLakeBucket
+          STATE_MACHINE_ARN: !Ref IngestionStateMachine
+          SECRET_NAME: !Ref PortalApiSecretName
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DataLakeBucket
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${PortalApiSecretName}*
+        - Statement:
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref IngestionStateMachine
+      Events:
+        DailyCheck:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: cron(0 12 * * ? *)
+            ScheduleExpressionTimezone: America/Sao_Paulo
+
+  DimensionLoaderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/dimension_loader/
+      Handler: lambda_function.handler
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET: !Ref DataLakeBucket
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref DataLakeBucket
+
+  IngestionWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: social-benefits-ingestion
+      CodeUri: ../src/ingestion_worker/
+      Handler: lambda_function.handler
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          BUCKET: !Ref DataLakeBucket
+          SECRET_NAME: !Ref PortalApiSecretName
+          INTERVALO_SEG: '0.34'
+          MARGEM_SEG: '30'
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref DataLakeBucket
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${PortalApiSecretName}*
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: DataLakeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DataLakeBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub ${DataLakeBucket.Arn}/*
+
+  TransformJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: social-benefits-transform
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: '5.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Ref GlueScriptUri
+      DefaultArguments:
+        '--BUCKET': !Ref DataLakeBucket
+        '--enable-glue-datacatalog': ''
+        '--job-bookmark-option': job-bookmark-disable
+        '--enable-observability-metrics': 'true'
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokePipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt IngestionWorkerFunction.Arn
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                Resource: !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${TransformJob}
+
+  IngestionStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: social-benefits-ingestion
+      DefinitionUri: ../stepfunctions/state_machine.asl.json
+      DefinitionSubstitutions:
+        IngestionWorkerArn: !GetAtt IngestionWorkerFunction.Arn
+        GlueJobName: !Ref TransformJob
+        DataLakeBucket: !Ref DataLakeBucket
+      Role: !GetAtt StateMachineRole.Arn
+      Type: STANDARD
+
+Outputs:
+  DataLakeBucketName:
+    Value: !Ref DataLakeBucket
+  StateMachineArn:
+    Value: !Ref IngestionStateMachine
